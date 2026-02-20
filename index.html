@@ -544,6 +544,7 @@ input[type=range] {
       <div class="stat">Layers Peeled: <span id="dstat-layers">0</span></div>
       <div class="stat">Strings Decoded: <span id="dstat-strs">0</span></div>
       <div class="stat">Junk Lines Removed: <span id="dstat-junk">0</span></div>
+      <div class="stat">Vars Renamed: <span id="dstat-renamed">0</span></div>
       <div class="stat">Output Size: <span id="dstat-size">0</span> bytes</div>
     </div>
 
@@ -924,6 +925,178 @@ function decodeHexEscapes(code) {
   return code.replace(/\\x([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
 }
 
+// ── SEMANTIC RENAMER ─────────────────────────────────────────────────────────
+// Looks at what each obfuscated variable is ASSIGNED TO or USED FOR,
+// then renames it to a human-readable name based on Roblox/Lua patterns.
+// Example: local xKpLmNqR = game:GetService("Players") → local Players
+function semanticRename(code) {
+  let renamed = 0;
+  const nameMap = {}; // obfName → readable name
+  const usedNames = new Set(); // avoid duplicate readable names
+
+  function safeName(base) {
+    if (!usedNames.has(base)) { usedNames.add(base); return base; }
+    let i = 2;
+    while (usedNames.has(base + i)) i++;
+    usedNames.add(base + i); return base + i;
+  }
+
+  // ── PATTERN TABLE ──────────────────────────────────────────────────────────
+  // Each entry: [regex to match the assignment RHS, readable name to give the var]
+  const patterns = [
+    // Roblox services
+    [/GetService\s*\(\s*["']Players["']\s*\)/,              'Players'],
+    [/GetService\s*\(\s*["']RunService["']\s*\)/,           'RunService'],
+    [/GetService\s*\(\s*["']ReplicatedStorage["']\s*\)/,    'ReplicatedStorage'],
+    [/GetService\s*\(\s*["']UserInputService["']\s*\)/,     'UserInputService'],
+    [/GetService\s*\(\s*["']VirtualInputManager["']\s*\)/,  'VirtualInputManager'],
+    [/GetService\s*\(\s*["']HttpService["']\s*\)/,          'HttpService'],
+    [/GetService\s*\(\s*["']TweenService["']\s*\)/,         'TweenService'],
+    [/GetService\s*\(\s*["']Workspace["']\s*\)/,            'Workspace'],
+    [/GetService\s*\(\s*["']CoreGui["']\s*\)/,              'CoreGui'],
+    [/GetService\s*\(\s*["']StarterGui["']\s*\)/,           'StarterGui'],
+    [/GetService\s*\(\s*["']Lighting["']\s*\)/,             'Lighting'],
+    [/GetService\s*\(\s*["']SoundService["']\s*\)/,         'SoundService'],
+    [/GetService\s*\(\s*["']Stats["']\s*\)/,                'Stats'],
+
+    // LocalPlayer and common derivations
+    [/Players\.LocalPlayer(?!\s*\.\s*\w)/,                  'LocalPlayer'],
+    [/LocalPlayer\.Character(?!\s*\.\s*\w)/,                'Character'],
+    [/LocalPlayer\.PlayerGui/,                              'PlayerGui'],
+    [/LocalPlayer\.Backpack/,                               'Backpack'],
+    [/LocalPlayer\.Team(?!\s*\w)/,                          'LocalTeam'],
+    [/LocalPlayer\.UserId/,                                 'LocalUserId'],
+    [/\.Character\.HumanoidRootPart/,                       'HumanoidRootPart'],
+    [/Character:FindFirstChildOfClass\s*\(\s*["']Humanoid["']\s*\)/,  'Humanoid'],
+    [/Character:FindFirstChild\s*\(\s*["']Humanoid["']\s*\)/,         'Humanoid'],
+    [/Character:WaitForChild\s*\(\s*["']Humanoid["']\s*\)/,           'Humanoid'],
+    [/Character:FindFirstChild\s*\(\s*["']HumanoidRootPart["']\s*\)/, 'HumanoidRootPart'],
+
+    // Remotes
+    [/Remotes:FindFirstChild\s*\(\s*["']([^'"]+)["']\s*\)/,  (m) => m[1] + 'Remote'],
+    [/Remotes\.([A-Za-z][A-Za-z0-9_]+)(?=[^\w])/,           (m) => m[1] + 'Remote'],
+    [/WaitForChild\s*\(\s*["']ShootTheBall["']\s*\)/,        'ShootRemote'],
+    [/WaitForChild\s*\(\s*["']Action["']\s*\)/,              'ActionRemote'],
+    [/WaitForChild\s*\(\s*["']SoftDisPlayer["']\s*\)/,       'SoftDisRemote'],
+
+    // Common workspace objects
+    [/workspace:FindFirstChild\s*\(\s*["']ball["']\s*\)/,   'ball'],
+    [/workspace\.Bools/,                                     'Bools'],
+    [/Bools\.APG/,                                           'APG'],
+    [/Bools\.HPG/,                                           'HPG'],
+
+    // Fluent / GUI library
+    [/loadstring.*Fluent.*releases/,                         'Fluent'],
+    [/Fluent:CreateWindow/,                                  'Window'],
+    [/Window:AddTab/,                                        'Tab'],
+    [/:AddToggle\s*\(/,                                      'Toggle'],
+    [/:AddSlider\s*\(/,                                      'Slider'],
+    [/:AddDropdown\s*\(/,                                    'Dropdown'],
+    [/SaveManager/,                                          'SaveManager'],
+    [/InterfaceManager/,                                     'InterfaceManager'],
+
+    // Common Lua patterns
+    [/Instance\.new\s*\(\s*["']Part["']\s*\)/,              'Part'],
+    [/Instance\.new\s*\(\s*["']Frame["']\s*\)/,             'Frame'],
+    [/Instance\.new\s*\(\s*["']ScreenGui["']\s*\)/,         'ScreenGui'],
+    [/Instance\.new\s*\(\s*["']TextLabel["']\s*\)/,         'Label'],
+    [/Instance\.new\s*\(\s*["']TextButton["']\s*\)/,        'Button'],
+    [/Instance\.new\s*\(\s*["']TextBox["']\s*\)/,           'TextBox'],
+    [/Instance\.new\s*\(\s*["']ImageLabel["']\s*\)/,        'Image'],
+    [/Instance\.new\s*\(\s*["']RemoteEvent["']\s*\)/,       'RemoteEvent'],
+    [/Instance\.new\s*\(\s*["']BindableEvent["']\s*\)/,     'BindableEvent'],
+    [/Instance\.new\s*\(\s*["']BillboardGui["']\s*\)/,      'BillboardGui'],
+    [/RunService\.Heartbeat:Connect/,                        'HeartbeatConn'],
+    [/RunService\.PreRender:Connect/,                        'PreRenderConn'],
+    [/RunService\.RenderStepped:Connect/,                    'RenderConn'],
+    [/UserInputService\.InputBegan:Connect/,                 'InputBeganConn'],
+    [/HttpService:JSONEncode/,                               'jsonPayload'],
+    [/HttpService:JSONDecode/,                               'jsonData'],
+
+    // Math / numeric helpers
+    [/math\.random\s*\(/,                                    'randNum'],
+    [/os\.clock\s*\(\)/,                                     'startTime'],
+    [/os\.time\s*\(\)/,                                      'timestamp'],
+    [/tick\s*\(\)/,                                          'tickTime'],
+
+    // Config / state tables
+    [/=\s*\{\s*enabled\s*=\s*false/,                        'config'],
+    [/=\s*\{\s*enabled\s*=\s*true/,                         'config'],
+
+    // Function patterns — detect by what they do
+    [/function.*GetPlayers.*ipairs/,                         'getAllPlayers'],
+    [/function.*FindFirstChild.*ball/,                       'getBall'],
+    [/function.*HumanoidRootPart.*LookVector/,               'isLookingAt'],
+    [/function.*AssemblyLinearVelocity.*1600/,               'isSprinting'],
+    [/function.*AssemblyLinearVelocity.*900/,                'isDeking'],
+    [/function.*playerWeld/,                                 'getBallHolder'],
+    [/function.*SendKeyEvent.*Space/,                        'doJump'],
+    [/function.*FireServer.*TackIe/,                         'doTackle'],
+    [/VirtualInputManager:SendKeyEvent.*true.*false.*game/,  'keyPress'],
+  ];
+
+  // ── SCAN: find all local var declarations and their RHS ───────────────────
+  // Matches:  local VARNAME = <anything until newline or end>
+  //           local function VARNAME(
+  const localVarRe = /local\s+(?:function\s+)?([a-zA-Z_][a-zA-Z0-9_]{6,})\s*(?:=([^\n]+)|\()/g;
+  let m;
+  while ((m = localVarRe.exec(code)) !== null) {
+    const obfName = m[1];
+    const rhs = m[2] || '';
+
+    // skip if already a readable name (short, or common word)
+    if (obfName.length < 7) continue;
+    if (nameMap[obfName]) continue;
+
+    for (const [pattern, nameOrFn] of patterns) {
+      if (pattern.test(rhs) || pattern.test(m[0])) {
+        let readable;
+        if (typeof nameOrFn === 'function') {
+          const pm = pattern.exec(rhs) || pattern.exec(m[0]);
+          readable = pm ? nameOrFn(pm) : null;
+        } else {
+          readable = nameOrFn;
+        }
+        if (readable) {
+          nameMap[obfName] = safeName(readable);
+          renamed++;
+          break;
+        }
+      }
+    }
+
+    // Fallback heuristics if no pattern matched
+    if (!nameMap[obfName]) {
+      if (/Connect\s*\(function/.test(rhs))          nameMap[obfName] = safeName('connection');
+      else if (/task\.spawn/.test(rhs))              nameMap[obfName] = safeName('spawnedTask');
+      else if (/pcall/.test(rhs))                    nameMap[obfName] = safeName('ok');
+      else if (/math\.random/.test(rhs))             nameMap[obfName] = safeName('rand');
+      else if (/tostring/.test(rhs))                 nameMap[obfName] = safeName('str');
+      else if (/tonumber/.test(rhs))                 nameMap[obfName] = safeName('num');
+      else if (/FindFirstChild|WaitForChild/.test(rhs)) nameMap[obfName] = safeName('child');
+      else if (/:Connect\s*\(/.test(rhs))            nameMap[obfName] = safeName('conn');
+      else if (/\{\}/.test(rhs) || /= \{\}/.test(rhs)) nameMap[obfName] = safeName('tbl');
+      else if (/= \{/.test(rhs))                     nameMap[obfName] = safeName('data');
+      else if (/= ""/.test(rhs) || /= ''/.test(rhs)) nameMap[obfName] = safeName('str');
+      else if (/= 0/.test(rhs) || /= false/.test(rhs) || /= nil/.test(rhs) || /= true/.test(rhs))
+                                                     nameMap[obfName] = safeName('flag');
+      else if (/function\s*\(/.test(rhs))            nameMap[obfName] = safeName('fn');
+      else if (/loadstring/.test(rhs))               nameMap[obfName] = safeName('loadedFn');
+    }
+  }
+
+  // ── APPLY renames as whole-word replacements, longest first ──────────────
+  const sortedKeys = Object.keys(nameMap).sort((a, b) => b.length - a.length);
+  for (const obf of sortedKeys) {
+    const readable = nameMap[obf];
+    const re = new RegExp('\\b' + obf.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'g');
+    code = code.replace(re, readable);
+  }
+
+  return { code, count: renamed };
+}
+// ── END SEMANTIC RENAMER ─────────────────────────────────────────────────────
+
 function prettyPrint(code) {
   // Basic indentation cleanup
   const lines = code.split('\n').map(l => l.trim()).filter(l => l);
@@ -993,6 +1166,13 @@ async function runDeobfuscate() {
   const junkRes = removeJunkLocals(code);
   code = junkRes.code; totalJunk = junkRes.count;
 
+  // Layer 7: semantic variable rename (obf names → readable names)
+  toast('Analyzing variable semantics...', 'info', 1200);
+  await new Promise(r => setTimeout(r, 80));
+  const renameRes = semanticRename(code);
+  code = renameRes.code;
+  const totalRenamed = renameRes.count;
+
   // Pretty print
   code = prettyPrint(code);
 
@@ -1000,12 +1180,16 @@ async function runDeobfuscate() {
 
   const statsEl = document.getElementById('deobf-stats');
   statsEl.style.display = 'flex';
-  document.getElementById('dstat-layers').textContent = layersPeeled;
-  document.getElementById('dstat-strs').textContent   = totalStrs;
-  document.getElementById('dstat-junk').textContent   = totalJunk;
-  document.getElementById('dstat-size').textContent   = code.length.toLocaleString();
+  document.getElementById('dstat-layers').textContent  = layersPeeled;
+  document.getElementById('dstat-strs').textContent    = totalStrs;
+  document.getElementById('dstat-junk').textContent    = totalJunk;
+  document.getElementById('dstat-renamed').textContent = totalRenamed;
+  document.getElementById('dstat-size').textContent    = code.length.toLocaleString();
 
-  toast(layersPeeled > 0 ? `Peeled ${layersPeeled} layer(s)!` : 'No standard layers detected — may be VM-based', layersPeeled > 0 ? 'ok' : 'info', 3500);
+  const msg = layersPeeled > 0
+    ? `Done! Peeled ${layersPeeled} layer(s), renamed ${totalRenamed} vars`
+    : 'No standard layers detected — may be VM-based';
+  toast(msg, layersPeeled > 0 ? 'ok' : 'info', 4000);
 }
 
 // keyboard shortcuts
